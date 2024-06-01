@@ -1,0 +1,150 @@
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from airflow.utils.dates import days_ago
+from pyspark.sql import SparkSession
+import pandas as pd
+import os
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+    'start_date': datetime(2021, 1, 1),
+}
+
+dag = DAG(
+    'excel_to_csv_pyspark',
+    default_args=default_args,
+    description='A DAG to convert Excel files to CSV, merge them, and clean data using PySpark',
+    schedule_interval='@daily',
+    catchup=False,
+)
+
+data_folder = "/home/vishprospero/Docchoice/Collection by Billing Code CBC/Diagnostic"
+csv_folder = "/home/vishprospero/airflow/output_pyspark"
+
+def create_spark_session():
+    jar_path = "/home/vishprospero/airflow/jars/spark-excel_2.12-0.13.5.jar"
+    return SparkSession.builder \
+        .appName("ExcelToCSV") \
+        .config("spark.jars", jar_path) \
+        .config("spark.executor.extraClassPath", jar_path) \
+        .config("spark.driver.extraClassPath", jar_path) \
+        .getOrCreate()
+
+def check_input_directory(**kwargs):
+    if not os.path.exists(data_folder):
+        raise FileNotFoundError(f"Input directory not found at {data_folder}")
+    else:
+        print(f"Input directory found at {data_folder}")
+        files = os.listdir(data_folder)
+        print(f"Files in input directory: {files}")
+
+check_input_dir_task = PythonOperator(
+    task_id='check_input_directory',
+    python_callable=check_input_directory,
+    provide_context=True,
+    dag=dag,
+)
+
+def convert_excel_to_csv(**kwargs):
+    spark = create_spark_session()
+    if not os.path.exists(csv_folder):
+        os.makedirs(csv_folder)
+        print(f"Created CSV directory at {csv_folder}")
+
+    files_converted = 0
+    for filename in os.listdir(data_folder):
+        if filename.endswith('.xls'):
+            excel_path = os.path.join(data_folder, filename)
+            csv_filename = filename.replace('.xls', '.csv')
+            csv_path = os.path.join(csv_folder, csv_filename)
+            try:
+                df = spark.read \
+                    .format("com.crealytics.spark.excel") \
+                    .option("sheetName", "Details - Collection By Billing") \
+                    .option("header", "true") \
+                    .option("startFromHeader", "1") \
+                    .load(excel_path)
+                df.toPandas().to_csv(csv_path, index=False)
+                print(f'Converted {filename} to {csv_filename}')
+                files_converted += 1
+            except Exception as e:
+                print(f"Error reading {filename}: {e}")
+
+    if files_converted == 0:
+        raise FileNotFoundError("No Excel files found to convert.")
+
+
+convert_task = PythonOperator(
+    task_id='convert_excel_to_csv',
+    python_callable=convert_excel_to_csv,
+    provide_context=True,
+    dag=dag,
+)
+
+def check_csv_directory(**kwargs):
+    if not os.path.exists(csv_folder):
+        raise FileNotFoundError(f"CSV directory not found at {csv_folder}")
+    else:
+        csv_files = [f for f in os.listdir(csv_folder) if f.endswith('.csv')]
+        if not csv_files:
+            raise FileNotFoundError("No CSV files found in the CSV directory")
+        else:
+            print(f"CSV files found in the CSV directory: {csv_files}")
+
+check_csv_dir_task = PythonOperator(
+    task_id='check_csv_directory',
+    python_callable=check_csv_directory,
+    provide_context=True,
+    dag=dag,
+)
+
+def merge_csv_files(**kwargs):
+    spark = create_spark_session()
+    if not os.path.exists(csv_folder):
+        raise FileNotFoundError(f"CSV directory not found at {csv_folder}")
+
+    csv_files = [os.path.join(csv_folder, f) for f in os.listdir(csv_folder) if f.endswith('.csv')]
+    if not csv_files:
+        raise FileNotFoundError("No CSV files found to merge.")
+
+    dfs = [spark.read.csv(f, header=True, inferSchema=True) for f in csv_files]
+    merged_df = dfs[0]
+    for df in dfs[1:]:
+        merged_df = merged_df.union(df)
+    merged_path = os.path.join(csv_folder, 'merged.csv')
+    merged_df.toPandas().to_csv(merged_path, index=False)
+    print(f"Merged CSV saved at {merged_path}")
+
+merge_task = PythonOperator(
+    task_id='merge_csv_files',
+    python_callable=merge_csv_files,
+    provide_context=True,
+    dag=dag,
+)
+
+def clean_merged_csv(**kwargs):
+    merged_path = os.path.join(csv_folder, 'merged.csv')
+    if not os.path.exists(merged_path):
+        raise FileNotFoundError(f"Merged CSV file not found at {merged_path}")
+
+    df = pd.read_csv(merged_path)
+    df.fillna('0', inplace=True)
+    df.dropna(how='all', inplace=True)
+    cleaned_path = os.path.join(csv_folder, 'cleaned_merged.csv')
+    df.to_csv(cleaned_path, index=False)
+    print(f"Cleaned merged CSV saved at {cleaned_path}")
+
+clean_task = PythonOperator(
+    task_id='clean_merged_csv',
+    python_callable=clean_merged_csv,
+    provide_context=True,
+    dag=dag,
+)
+
+check_input_dir_task >> convert_task >> check_csv_dir_task >> merge_task >> clean_task
