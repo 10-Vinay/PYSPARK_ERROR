@@ -1,0 +1,203 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+import pandas as pd
+import os
+import glob
+import psycopg2
+import pytz
+import hashlib
+import sqlalchemy
+import pg8000
+from sqlalchemy import inspect, text
+from datetime import datetime, timedelta
+from configparser import ConfigParser
+from google.cloud.sql.connector import Connector, IPTypes
+
+# Define the default arguments for the DAG
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+    'start_date': days_ago(1),
+}
+
+# Define the DAG
+dag = DAG(
+    'diagnostics_billing_etl_3',
+    default_args=default_args,
+    description='A DAG to process diagnostic billing data',
+    schedule_interval='@daily',
+    catchup=False,
+)
+
+file_pattern = "/home/vishprospero/Docchoice/Collection by Billing Code CBC/Diagnostic/*.xls"  # Update this path
+
+def read_excel_files(**kwargs):
+    files = glob.glob(file_pattern)
+    df_list = []
+    for file in files:
+        print("Reading file:", file)
+        df = pd.read_excel(file, sheet_name="Details - Collection By Billing", skiprows=1, header=0)
+        df_list.append(df)
+    df = pd.concat(df_list)
+    
+    # Reset index to ensure uniqueness
+    df.reset_index(drop=True, inplace=True)
+    
+    kwargs['ti'].xcom_push(key='raw_data', value=df.to_json())
+
+def preprocess_data(**kwargs):
+    ti = kwargs['ti']
+    raw_data_json = ti.xcom_pull(key='raw_data', task_ids='read_excel_files')
+    df = pd.read_json(raw_data_json)
+
+    df['Bill Date'] = pd.to_datetime(df['Bill Date'], format='%d-%b-%Y %I.%M.%S %p')
+    df['Date'] = df['Bill Date'].dt.date
+    df['Time'] = df['Bill Date'].dt.time
+    df['Month-Year'] = df['Bill Date'].dt.strftime('%B %Y')
+    df.drop(columns=["#", "Bill Date"], inplace=True)
+    df['hash_id'] = df.apply(generate_hash_id, axis=1)
+
+    kwargs['ti'].xcom_push(key='processed_data', value=df.to_json())
+
+def generate_hash_id(row):
+    hash_input = f"{row['Bill Type']}{row['Bill No']}{row['Patient Name']}{row['Billing Code']}{row['Service Type']}{row['Qty']}{row['Billed']}{row['Disc. Amt']}{row['Net Amt']}{row['Date']}{row['Time']}"
+    return hashlib.sha256(hash_input.encode()).hexdigest()
+
+def get_database_connection():
+    config = ConfigParser()
+    config.read('/home/vishprospero/FinGPT/src/app/config.ini')  # Assuming config file is in the 'app' directory
+    db_config = config['database']
+
+    db_user = 'postgres'  # e.g. 'my-database-user'
+    db_pass = 'a55zWlt:CYtAi|FB(|jJSpRA90N}'  # e.g. 'my-database-password'
+    db_name = 'data-lake-table' #'fingpt-db-dev'  # e.g. 'my-database'
+    unix_socket_path = 'independent-way-410316:us-central1:collaborativedocsdb-test' 
+    ip_type = IPTypes.PRIVATE if os.environ.get("PRIVATE_IP") else IPTypes.PUBLIC
+
+    # initialize Cloud SQL Python Connector object
+    connector = Connector()
+
+
+    def getconn() -> pg8000.dbapi.Connection:
+        conn: pg8000.dbapi.Connection = connector.connect(
+            unix_socket_path,
+            "pg8000",
+            user=db_user,
+            password=db_pass,
+            db=db_name,
+            ip_type=ip_type
+        )
+        return conn
+
+    pool = sqlalchemy.create_engine(
+        "postgresql+pg8000://",
+        creator=getconn,
+        pool_size=5,
+        max_overflow=2,
+        pool_timeout=30,  # 30 seconds
+        pool_recycle=1800  # 30 minutes
+    )
+    return pool
+
+def create_diagnostics_billing_table(**kwargs):
+    engine = get_database_connection()
+    create_diagnostics_billing = text("""
+    CREATE TABLE IF NOT EXISTS diagnostics_billing_airflow (
+        bill_type VARCHAR,
+        bill_no VARCHAR,
+        patient_name VARCHAR,
+        billing_code VARCHAR,
+        service_type VARCHAR,
+        qty INTEGER,
+        billed DECIMAL,
+        disc_amt DECIMAL,
+        net_amt DECIMAL,
+        date DATE,
+        time TIME,
+        month_year VARCHAR,
+        ingestion_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        update_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        hash_id VARCHAR PRIMARY KEY
+    );
+    """)
+    with engine.connect() as conn:
+        conn.execute(create_diagnostics_billing)
+
+def bulk_insert_data_to_database(engine, df):
+    records = []
+    current_timestamp_iso = datetime.utcnow().isoformat()
+    for index, row in df.iterrows():
+        records.append({
+            'bill_type': row['Bill Type'],
+            'bill_no': row['Bill No'],
+            'patient_name': row['Patient Name'],
+            'billing_code': row['Billing Code'],
+            'service_type': row['Service Type'],
+            'qty': row['Qty'],
+            'billed': row['Billed'],
+            'disc_amt': row['Disc. Amt'],
+            'net_amt': row['Net Amt'],
+            'date': row['Date'],
+            'time': row['Time'],
+            'month_year': row['Month-Year'],
+            'hash_id': row['hash_id'],
+            'ingestion_date': current_timestamp_iso,
+            'update_date': current_timestamp_iso
+        })
+
+    insert_query = text("""
+        INSERT INTO diagnostics_billing_airflow (
+            bill_type, bill_no, patient_name, billing_code, service_type, qty, billed, disc_amt, net_amt, date, time, month_year, hash_id, ingestion_date, update_date
+        ) VALUES (
+            :bill_type, :bill_no, :patient_name, :billing_code, :service_type, :qty, :billed, :disc_amt, :net_amt, :date, :time, :month_year, :hash_id, :ingestion_date, :update_date
+        ) ON CONFLICT (hash_id) DO NOTHING;
+    """)
+
+    batch_size = 1000
+    with engine.connect() as conn:
+        for i in range(0, len(records), batch_size):
+            batch_records = records[i:i+batch_size]
+            print(f"Inserting Rows {i} to {i+batch_size}")
+            conn.execute(insert_query, batch_records)
+
+def insert_data_to_database(**kwargs):
+    ti = kwargs['ti']
+    processed_data_json = ti.xcom_pull(key='processed_data', task_ids='preprocess_data')
+    df = pd.read_json(processed_data_json)
+    engine = get_database_connection()
+    bulk_insert_data_to_database(engine, df)
+
+read_excel_task = PythonOperator(
+    task_id='read_excel_files',
+    python_callable=read_excel_files,
+    provide_context=True,
+    dag=dag,
+)
+
+preprocess_data_task = PythonOperator(
+    task_id='preprocess_data',
+    python_callable=preprocess_data,
+    provide_context=True,
+    dag=dag,
+)
+
+create_table_task = PythonOperator(
+    task_id='create_diagnostics_billing_table',
+    python_callable=create_diagnostics_billing_table,
+    provide_context=True,
+    dag=dag,
+)
+
+insert_data_task = PythonOperator(
+    task_id='insert_data_to_database',
+    python_callable=insert_data_to_database,
+    provide_context=True,
+    dag=dag,
+)
+
+read_excel_task >> preprocess_data_task >> create_table_task >> insert_data_task
